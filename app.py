@@ -105,8 +105,10 @@ input[type=text]::placeholder{color:var(--gray-400)}
 .dl-stat.spd b{color:var(--blue)}
 .dl-stat.pct b{color:var(--brand)}
 /* download file button */
-.file-dl-btn{display:inline-flex;align-items:center;gap:6px;margin-top:8px;padding:6px 12px;background:var(--green-light);border:1px solid var(--green-border);border-radius:6px;color:var(--green);font-size:12px;font-weight:600;font-family:var(--font-ui);cursor:pointer;text-decoration:none;transition:all .15s}
+.file-dl-btn{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;background:var(--green-light);border:1px solid var(--green-border);border-radius:6px;color:var(--green);font-size:12px;font-weight:600;font-family:var(--font-ui);cursor:pointer;text-decoration:none;transition:all .15s}
 .file-dl-btn:hover{background:#dcfce7}
+.file-dl-primary{background:var(--brand)!important;border-color:var(--brand)!important;color:#fff!important}
+.file-dl-primary:hover{background:var(--brand-hover)!important}
 @media(max-width:480px){.quality-grid{grid-template-columns:repeat(2,1fr)}.app{padding:16px 12px 80px}}
 </style>
 </head>
@@ -281,6 +283,8 @@ function setBadge(id, cls, text) {
 const RE = /(\d+\.?\d*)%\s+of\s+([\d.]+\s*\S+)\s+at\s+([\d.]+\s*\S+\/s)\s+ETA\s+(\S+)/;
 
 function downloadOne(id, url, startTime, endTime) {
+  // capture for use inside SSE done handler
+  const _url = url, _start = startTime||"", _end = endTime||"";
   return new Promise(resolve => {
     const item = document.getElementById("item-"+id);
     item.classList.add("active");
@@ -324,14 +328,27 @@ function downloadOne(id, url, startTime, endTime) {
           document.getElementById("icon-"+id).innerHTML = iconSVG("done");
           document.getElementById("icon-"+id).style.color = "";
           setBadge(id, "badge-done", "Done");
-          // ── Show download button ──
-          if (data.file_id) {
-            document.getElementById("file-"+id).innerHTML =
-              `<a class="file-dl-btn" href="/get-file/${data.file_id}" download>
+          // ── Show save buttons ──
+          const streamParams = new URLSearchParams({
+            url: _url, format: fmt, quality,
+            filename: data.filename || ("download." + (fmt==="mp3"?"mp3":"mp4"))
+          });
+          if (_start) streamParams.append("start", _start);
+          if (_end)   streamParams.append("end",   _end);
+
+          const saveParams = new URLSearchParams({ file_id: data.file_id });
+
+          document.getElementById("file-"+id).innerHTML = `
+            <div style="display:flex;flex-direction:column;gap:6px;margin-top:8px">
+              <a class="file-dl-btn file-dl-primary" href="/stream-file?${streamParams}" download>
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-                Save to device — ${data.filename}
-              </a>`;
-          }
+                Save to device (1-step stream)
+              </a>
+              <a class="file-dl-btn" href="/get-file/${data.file_id}" download style="background:var(--gray-50);border-color:var(--gray-200);color:var(--gray-500)">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                Fallback: serve cached file
+              </a>
+            </div>`;
         } else {
           item.classList.add("failed");
           document.getElementById("bar-"+id).style.cssText="width:100%;background:var(--red-text)";
@@ -505,6 +522,57 @@ def get_file(file_id):
         return ("File not found", 404)
     return send_file(filepath, as_attachment=True,
                      download_name=os.path.basename(filepath))
+
+@app.route("/stream-file")
+def stream_file():
+    """
+    Streams the file directly to the browser as yt-dlp downloads it.
+    Browser sees it as a file download — only 1 download total.
+    Works for simple mp4/mp3. Does NOT work when merging is needed
+    (merging requires the full file first). Falls back to 2-step for those.
+    """
+    url     = request.args.get("url", "").strip()
+    fmt     = request.args.get("format", "mp4")
+    quality = request.args.get("quality", "bestvideo+bestaudio/best")
+    start   = request.args.get("start", "").strip()
+    end     = request.args.get("end",   "").strip()
+    fname   = request.args.get("filename", "video.mp4")
+
+    if not url:
+        return ("No URL", 400)
+
+    def generate():
+        cmd = ["yt-dlp", "-o", "-", "--no-playlist"]
+        if fmt == "mp3":
+            cmd += ["-f", "bestaudio", "-x", "--audio-format", "mp3",
+                    "--audio-quality", "0"]
+        else:
+            # Use single best combined format to avoid merge step
+            cmd += ["-f", "best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"]
+        if start or end:
+            s = start if start else "0"
+            e = end   if end   else "inf"
+            cmd += ["--download-sections", f"*{s}-{e}", "--force-keyframes-at-cuts"]
+        cmd.append(url)
+
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        try:
+            while True:
+                chunk = proc.stdout.read(65536)  # 64KB chunks
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            proc.kill()
+
+    mime = "audio/mpeg" if fmt == "mp3" else "video/mp4"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{fname}"',
+        "Content-Type": mime,
+        "X-Accel-Buffering": "no",
+        "Cache-Control": "no-cache",
+    }
+    return Response(generate(), headers=headers, direct_passthrough=True)
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
