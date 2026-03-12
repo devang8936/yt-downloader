@@ -455,15 +455,36 @@ def download():
         q = queue.Queue()
 
         def run():
-            cmd = ["yt-dlp", "--newline", "--progress"]
+            # Find ffmpeg in nix store path on Railway
+            import shutil
+            ffmpeg_path = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+            cmd = ["yt-dlp", "--newline", "--progress", "--ffmpeg-location", ffmpeg_path]
             if fmt == "mp3":
-                cmd += ["-f", "bestaudio", "-x", "--audio-format", "mp3", "--audio-quality", "0"]
+                # audio only — no ffmpeg needed if we pick m4a and skip conversion
+                cmd += ["-f", "bestaudio[ext=m4a]/bestaudio"]
             else:
-                cmd += [
-                    "-f", quality,
-                    "--merge-output-format", "mp4",
-                    "--postprocessor-args", "ffmpeg:-c:a aac",
-                ]
+                # Pick a single pre-merged file — no ffmpeg merge needed
+                # Falls back through options until one works
+                fmt_selector = (
+                    "best[ext=mp4]"           # best single-file mp4
+                    "/bestvideo[ext=mp4]+bestaudio[ext=m4a]"  # mp4+m4a (ffmpeg merge)
+                    "/best"                   # whatever is available
+                )
+                # Override with quality-specific selector if not Auto
+                if quality != "bestvideo+bestaudio/best":
+                    # extract height from quality string e.g. height<=1080
+                    import re as _re
+                    h = _re.search(r'height<=(\d+)', quality)
+                    if h:
+                        ht = h.group(1)
+                        fmt_selector = (
+                            f"best[ext=mp4][height<={ht}]"
+                            f"/bestvideo[ext=mp4][height<={ht}]+bestaudio[ext=m4a]"
+                            f"/best[height<={ht}]"
+                            f"/best[ext=mp4]"
+                            f"/best"
+                        )
+                cmd += ["-f", fmt_selector, "--merge-output-format", "mp4"]
             if start or end:
                 s = start if start else "0"
                 e = end   if end   else "inf"
