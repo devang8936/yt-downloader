@@ -4,6 +4,13 @@ YouTube Downloader — Railway Hosted Version
 Files are downloaded on the server, then sent to the user's browser.
 """
 
+# gevent monkey-patch must be first — enables async SSE streaming on Railway
+try:
+    from gevent import monkey
+    monkey.patch_all()
+except ImportError:
+    pass
+
 import os, subprocess, threading, queue, json, uuid, glob
 from flask import Flask, request, Response, send_file, jsonify
 
