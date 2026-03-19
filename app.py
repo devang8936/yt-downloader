@@ -4,15 +4,18 @@ YouTube Downloader — Railway Hosted Version
 Files are downloaded on the server, then sent to the user's browser.
 """
 
-# gevent monkey-patch must be first — enables async SSE streaming on Railway
+# gevent monkey-patch must be first — enables async SSE streaming
 try:
     from gevent import monkey
     monkey.patch_all()
 except ImportError:
     pass
 
-import os, subprocess, threading, queue, json, uuid, glob
-from flask import Flask, request, Response, send_file, jsonify
+import os, subprocess, threading, queue, json, uuid, glob, shutil
+from flask import Flask, request, Response, send_file
+
+# Find ffmpeg — on Render (Ubuntu) it's installed via apt-get
+FFMPEG = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 
 # ── Embedded HTML ─────────────────────────────────────────────────────────────
 HTML = r"""<!DOCTYPE html>
@@ -472,10 +475,7 @@ def download():
         q = queue.Queue()
 
         def run():
-            # Find ffmpeg in nix store path on Railway
-            import shutil
-            ffmpeg_path = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
-            cmd = ["yt-dlp", "--newline", "--progress", "--ffmpeg-location", ffmpeg_path]
+            cmd = ["yt-dlp", "--newline", "--progress", "--ffmpeg-location", FFMPEG]
             import re as _re
             if fmt == "mp3":
                 cmd += ["-f", "bestaudio", "-x", "--audio-format", "mp3", "--audio-quality", "0"]
@@ -561,6 +561,23 @@ def stream_file():
         return ("File not found or expired", 404)
     return send_file(filepath, as_attachment=True,
                      download_name=os.path.basename(filepath))
+
+# ── Keep-alive ping (prevents Render free tier spin-down) ────────────────────
+@app.route("/ping")
+def ping():
+    return "ok"
+
+# ── Debug route ───────────────────────────────────────────────────────────────
+@app.route("/debug")
+def debug():
+    ffver = "not found"
+    try:
+        ffver = subprocess.check_output([FFMPEG, "-version"],
+                stderr=subprocess.STDOUT, text=True).split("\n")[0]
+    except Exception as e:
+        ffver = str(e)
+    ytdlp = shutil.which("yt-dlp") or "not found"
+    return {"ffmpeg": FFMPEG, "ffmpeg_version": ffver, "yt-dlp": ytdlp}
 
 # ── Launch ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
