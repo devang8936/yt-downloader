@@ -4,13 +4,6 @@ YouTube Downloader — Railway Hosted Version
 Files are downloaded on the server, then sent to the user's browser.
 """
 
-# gevent monkey-patch must be first — enables async SSE streaming
-try:
-    from gevent import monkey
-    monkey.patch_all()
-except ImportError:
-    pass
-
 import os, subprocess, threading, queue, json, uuid, glob, shutil
 from flask import Flask, request, Response, send_file
 
@@ -438,23 +431,6 @@ file_registry = {}
 @app.route("/")
 def index():
     return HTML
-
-@app.route("/debug")
-def debug():
-    import shutil, subprocess as sp
-    ffmpeg = shutil.which("ffmpeg") or "NOT FOUND"
-    ytdlp  = shutil.which("yt-dlp") or "NOT FOUND"
-    # test ffmpeg version
-    try:
-        ffver = sp.check_output([ffmpeg, "-version"], stderr=sp.STDOUT, text=True).split("\n")[0] if ffmpeg != "NOT FOUND" else "N/A"
-    except:
-        ffver = "ERROR running ffmpeg"
-    return {
-        "ffmpeg_path": ffmpeg,
-        "ffmpeg_version": ffver,
-        "ytdlp_path": ytdlp,
-        "tmp_space": str(shutil.disk_usage("/tmp"))
-    }
 
 @app.route("/download")
 def download():
