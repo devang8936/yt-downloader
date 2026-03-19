@@ -1,17 +1,5 @@
-"""
-YouTube Downloader — Railway Hosted Version
-============================================
-Files are downloaded on the server, then sent to the user's browser.
-"""
-
-import os, subprocess, threading, queue, json, uuid, glob, shutil
-from flask import Flask, request, Response, send_file
-
-# Find ffmpeg — on Render (Ubuntu) it's installed via apt-get
-FFMPEG = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
-
-# ── Embedded HTML ─────────────────────────────────────────────────────────────
-HTML = r"""<!DOCTYPE html>
+HTML = r"""
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
@@ -420,95 +408,97 @@ function startAll() {
 </body>
 </html>"""
 
-# ── Flask ─────────────────────────────────────────────────────────────────────
+import os, subprocess, threading, queue, json, uuid, glob, shutil
+from flask import Flask, request, Response, send_file
+
 app = Flask(__name__)
 DOWNLOAD_DIR = "/tmp/ytdown"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-# Store filename by file_id so we can serve it
 file_registry = {}
+# Find ffmpeg — try system, then imageio's bundled copy
+FFMPEG = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+try:
+    import imageio_ffmpeg
+    FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    pass
 
 @app.route("/")
 def index():
     return HTML
 
+@app.route("/ping")
+def ping():
+    return "ok"
+
+@app.route("/debug")
+def debug():
+    ffver = "error"
+    try:
+        ffver = subprocess.check_output([FFMPEG, "-version"], stderr=subprocess.STDOUT, text=True).split("\n")[0]
+    except Exception as e:
+        ffver = str(e)
+    ytdlp = shutil.which("yt-dlp") or "not found"
+    return {"ffmpeg": FFMPEG, "ffmpeg_version": ffver, "yt-dlp": ytdlp}
+
 @app.route("/download")
 def download():
+    import re
     url     = request.args.get("url", "").strip()
     fmt     = request.args.get("format", "mp4")
     quality = request.args.get("quality", "bestvideo+bestaudio/best")
     start   = request.args.get("start", "").strip()
     end     = request.args.get("end",   "").strip()
-
     if not url:
         return ("No URL", 400)
-
-    file_id  = str(uuid.uuid4())
-    out_dir  = os.path.join(DOWNLOAD_DIR, file_id)
+    file_id = str(uuid.uuid4())
+    out_dir = os.path.join(DOWNLOAD_DIR, file_id)
     os.makedirs(out_dir, exist_ok=True)
 
     def generate():
         q = queue.Queue()
-
         def run():
             cmd = ["yt-dlp", "--newline", "--progress", "--ffmpeg-location", FFMPEG]
-            import re as _re
             if fmt == "mp3":
                 cmd += ["-f", "bestaudio", "-x", "--audio-format", "mp3", "--audio-quality", "0"]
             else:
-                # Extract height limit from quality selector if set
-                h = _re.search(r'height<=(\d+)', quality)
+                h = re.search("height<=(\\d+)", quality)
                 if h:
                     ht = h.group(1)
-                    # Try pre-merged first, then merge with ffmpeg
-                    fmt_selector = (
-                        f"bestvideo[height<={ht}][ext=mp4]+bestaudio[ext=m4a]"
-                        f"/bestvideo[height<={ht}]+bestaudio"
-                        f"/best[height<={ht}][ext=mp4]"
-                        f"/best[height<={ht}]"
-                    )
+                    fmt_sel = (f"bestvideo[height<={ht}][ext=mp4]+bestaudio[ext=m4a]"
+                               f"/bestvideo[height<={ht}]+bestaudio"
+                               f"/best[height<={ht}][ext=mp4]/best[height<={ht}]")
                 else:
-                    # Auto — best available
-                    fmt_selector = (
-                        "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
-                        "/bestvideo+bestaudio"
-                        "/best[ext=mp4]"
-                        "/best"
-                    )
-                cmd += ["-f", fmt_selector, "--merge-output-format", "mp4",
+                    fmt_sel = ("bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+                               "/bestvideo+bestaudio/best[ext=mp4]/best")
+                cmd += ["-f", fmt_sel, "--merge-output-format", "mp4",
                         "--postprocessor-args", "ffmpeg:-c:a aac -c:v copy"]
             if start or end:
                 s = start if start else "0"
                 e = end   if end   else "inf"
                 cmd += ["--download-sections", f"*{s}-{e}", "--force-keyframes-at-cuts"]
-
             out_tpl = os.path.join(out_dir, "%(title)s.%(ext)s")
             cmd += ["-o", out_tpl, "--no-playlist", url]
-
             try:
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                        stderr=subprocess.STDOUT, text=True, bufsize=1)
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
                 for line in proc.stdout:
                     q.put(line)
                 proc.wait()
                 q.put(f"__EXIT__{proc.returncode}")
             except FileNotFoundError:
-                q.put("__ERROR__yt-dlp not found")
+                q.put("__ERROR__yt-dlp not found on server")
 
         threading.Thread(target=run, daemon=True).start()
-
         while True:
             line = q.get()
             if line.startswith("__EXIT__"):
                 code = int(line.replace("__EXIT__", ""))
-                # Find the downloaded file
                 files = glob.glob(os.path.join(out_dir, "*"))
                 filename = ""
                 if files and code == 0:
                     filepath = files[0]
                     filename = os.path.basename(filepath)
                     file_registry[file_id] = filepath
-
                 yield f"data: {json.dumps({'type':'done','code':code,'file_id':file_id,'filename':filename})}\n\n"
                 break
             elif line.startswith("__ERROR__"):
@@ -518,44 +508,15 @@ def download():
                 yield f"data: {json.dumps({'type':'log','line':line.rstrip()})}\n\n"
 
     return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 @app.route("/get-file/<file_id>")
 def get_file(file_id):
     filepath = file_registry.get(file_id)
     if not filepath or not os.path.exists(filepath):
         return ("File not found", 404)
-    return send_file(filepath, as_attachment=True,
-                     download_name=os.path.basename(filepath))
+    return send_file(filepath, as_attachment=True, download_name=os.path.basename(filepath))
 
-@app.route("/stream-file")
-def stream_file():
-    """Serves already-downloaded file to browser."""
-    file_id = request.args.get("file_id", "").strip()
-    filepath = file_registry.get(file_id)
-    if not filepath or not os.path.exists(filepath):
-        return ("File not found or expired", 404)
-    return send_file(filepath, as_attachment=True,
-                     download_name=os.path.basename(filepath))
-
-# ── Keep-alive ping (prevents Render free tier spin-down) ────────────────────
-@app.route("/ping")
-def ping():
-    return "ok"
-
-# ── Debug route ───────────────────────────────────────────────────────────────
-@app.route("/debug")
-def debug():
-    ffver = "not found"
-    try:
-        ffver = subprocess.check_output([FFMPEG, "-version"],
-                stderr=subprocess.STDOUT, text=True).split("\n")[0]
-    except Exception as e:
-        ffver = str(e)
-    ytdlp = shutil.which("yt-dlp") or "not found"
-    return {"ffmpeg": FFMPEG, "ffmpeg_version": ffver, "yt-dlp": ytdlp}
-
-# ── Launch ────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"\n  Running on http://localhost:{port}\n")
